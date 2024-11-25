@@ -60,6 +60,7 @@ class _FaceDetectionPageState extends State<FaceDetectionPage>
   bool _isDetecting = false;
   List<Face> _faces = [];
   String _emotion = "알 수 없음";
+  String imgName = "test_image";
 
   @override
   void initState() {
@@ -234,8 +235,7 @@ class _FaceDetectionPageState extends State<FaceDetectionPage>
       final Uint8List faceBytes = Uint8List.fromList(img.encodePng(faceImage));
 
       // 갤러리에 저장
-      await saveImageToGallery(
-          faceBytes, "face_debug_${DateTime.now().millisecondsSinceEpoch}");
+      await saveImageToGallery(faceBytes, imgName);
       print("Face bytes extracted successfully.");
 
       return faceBytes;
