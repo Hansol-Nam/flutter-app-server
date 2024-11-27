@@ -69,7 +69,7 @@ class _FaceDetectionPageState extends State<FaceDetectionPage>
   static const Duration frameInterval =
       Duration(milliseconds: 50); // 프레임 처리 간격 조정
   static const Duration emotionInterval =
-      Duration(seconds: 3); // 감정 예측 간격 조정 (조절 가능)
+      Duration(milliseconds: 500); // 감정 예측 간격 조정 (조절 가능)
 
   String imgName = "test_image";
 
