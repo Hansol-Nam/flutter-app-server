@@ -1,15 +1,17 @@
 import 'dart:async';
+import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:camera/camera.dart';
 import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
 import 'package:image/image.dart' as img;
 import 'package:permission_handler/permission_handler.dart';
-import 'package:path_provider/path_provider.dart';
-import 'package:gallery_saver/gallery_saver.dart';
-import 'dart:io';
+import 'dart:math' as math;
 import 'package:http/http.dart' as http;
 import 'dart:convert'; // jsonDecode를 위해 추가
+import 'dart:isolate';
+import 'package:path_provider/path_provider.dart'; // 추가
+import 'package:http_parser/http_parser.dart'; // MediaType을 위해 필요
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -53,20 +55,24 @@ class _FaceDetectionPageState extends State<FaceDetectionPage>
   late Future<void> _initializeControllerFuture;
   final FaceDetector _faceDetector = FaceDetector(
     options: FaceDetectorOptions(
-      enableContours: true,
-      enableClassification: true,
-      minFaceSize: 0.1, // 최소 얼굴 크기 비율
-      performanceMode: FaceDetectorMode.accurate, // 정확도 우선 모드
+      enableContours: false,
+      enableClassification: false,
+      minFaceSize: 0.1,
+      performanceMode: FaceDetectorMode.fast,
     ),
   );
-  bool _isDetecting = false;
+  //bool _isDetecting = false;
   List<Face> _faces = [];
   String _emotion = "알 수 없음";
+
+  DateTime? _lastProcessedTime;
+  DateTime? _lastEmotionTime;
+
+  static const Duration frameInterval =
+      Duration(milliseconds: 50); // 프레임 처리 간격 조정
+  static const Duration emotionInterval = Duration(seconds: 2); // 감정 예측 간격 조정
+
   String imgName = "test_image";
-
-  DateTime? _lastProcessedTime; // 마지막으로 처리된 프레임 시간
-
-  static const Duration frameInterval = Duration(milliseconds: 200); // 5FPS 간격
 
   @override
   void initState() {
@@ -75,9 +81,9 @@ class _FaceDetectionPageState extends State<FaceDetectionPage>
     _requestPermission();
     _controller = CameraController(
       widget.camera,
-      ResolutionPreset.high,
+      ResolutionPreset.low, // 해상도 낮춤으로써 처리량 감소
       enableAudio: false,
-      imageFormatGroup: ImageFormatGroup.yuv420, // YUV420 강제 설정
+      imageFormatGroup: ImageFormatGroup.bgra8888, // iOS에서는 bgra8888 사용
     );
     _initializeControllerFuture = _controller.initialize().then((_) {
       if (!mounted) return;
@@ -106,60 +112,21 @@ class _FaceDetectionPageState extends State<FaceDetectionPage>
   void _processCameraImage(CameraImage image) async {
     final now = DateTime.now();
 
-    // 5FPS 간격으로 제한
     if (_lastProcessedTime != null &&
         now.difference(_lastProcessedTime!) < frameInterval) {
       return;
     }
     _lastProcessedTime = now;
 
-    if (_isDetecting) return;
-    _isDetecting = true;
+    //if (_isDetecting) return;
+    //_isDetecting = true;
 
     try {
-      final Size imageSize =
-          Size(image.width.toDouble(), image.height.toDouble());
+      // `CameraImage`를 `InputImage`로 변환
+      final inputImage = _getInputImageFromCameraImage(image);
 
-      // 카메라의 센서 방향을 기반으로 InputImageRotation 설정
-      final imageRotation = _convertSensorOrientationToInputImageRotation(
-          widget.camera.sensorOrientation);
-
-      final inputImageFormat =
-          InputImageFormatValue.fromRawValue(image.format.raw) ??
-              InputImageFormat.nv21;
-
-      final planeData = image.planes.map(
-        (Plane plane) {
-          return InputImagePlaneMetadata(
-            bytesPerRow: plane.bytesPerRow,
-            height: plane.height,
-            width: plane.width,
-          );
-        },
-      ).toList();
-
-      final inputImageData = InputImageData(
-        size: imageSize,
-        imageRotation: imageRotation,
-        inputImageFormat: inputImageFormat,
-        planeData: planeData,
-      );
-
-      final inputImage = InputImage.fromBytes(
-          bytes: _concatenatePlanes(image.planes),
-          inputImageData: inputImageData);
-
+      // 메인 스레드에서 얼굴 감지 수행
       final faces = await _faceDetector.processImage(inputImage);
-
-      if (faces.isEmpty) {
-        // 얼굴이 감지되지 않음
-        _isDetecting = false;
-        setState(() {
-          _faces = [];
-          _emotion = "알 수 없음";
-        });
-        return;
-      }
 
       if (mounted) {
         setState(() {
@@ -167,177 +134,157 @@ class _FaceDetectionPageState extends State<FaceDetectionPage>
         });
       }
 
-      for (var face in faces) {
-        // 얼굴의 boundingBox 추출
-        final rect = face.boundingBox;
+      if (faces.isNotEmpty) {
+        final faceRect = faces.first.boundingBox;
 
-        // 카메라 프레임에서 얼굴 영역 추출
-        Uint8List? faceBytes = await _extractFaceBytes(image, rect);
+        // 얼굴 영역 추출
+        final Uint8List faceBytes = _extractFaceBytes(image, faceRect);
 
-        if (faceBytes != null) {
-          // 네이티브 코드로 얼굴 이미지 전송 및 감정 예측
+        final now = DateTime.now();
+        if (_lastEmotionTime == null ||
+            now.difference(_lastEmotionTime!) >= emotionInterval) {
+          _lastEmotionTime = now;
+
+          // 감정 예측 수행
           String emotion = await _getEmotionFromServer(faceBytes);
-          setState(() {
-            _emotion = emotion;
-          });
+          if (mounted) {
+            setState(() {
+              _emotion = emotion;
+            });
+          }
         }
-      }
-
-      // 디버깅: 감지된 얼굴 수와 바운딩 박스 정보 출력
-      print("Detected ${faces.length} face(s).");
-      for (var face in faces) {
-        print("Face boundingBox: ${face.boundingBox}");
       }
     } catch (e) {
       print("Error processing image: $e");
     } finally {
-      _isDetecting = false;
+      //  _isDetecting = false;
     }
   }
 
-  // 이미지의 모든 평면을 하나의 바이트 배열로 결합
-  Uint8List _concatenatePlanes(List<Plane> planes) {
-    final WriteBuffer allBytes = WriteBuffer();
-    for (Plane plane in planes) {
+  InputImage _getInputImageFromCameraImage(CameraImage image) {
+    final allBytes = WriteBuffer();
+    for (var plane in image.planes) {
       allBytes.putUint8List(plane.bytes);
     }
-    return allBytes.done().buffer.asUint8List();
+    final bytes = allBytes.done().buffer.asUint8List();
+
+    final inputImage = InputImage.fromBytes(
+      bytes: bytes,
+      inputImageData: InputImageData(
+        size: Size(image.width.toDouble(), image.height.toDouble()),
+        imageRotation: _convertSensorOrientationToInputImageRotation(
+            widget.camera.sensorOrientation),
+        inputImageFormat: InputImageFormat.bgra8888,
+        planeData: image.planes.map((Plane plane) {
+          return InputImagePlaneMetadata(
+            bytesPerRow: plane.bytesPerRow,
+            height: plane.height,
+            width: plane.width,
+          );
+        }).toList(),
+      ),
+    );
+
+    return inputImage;
   }
 
-  Future<Uint8List?> _extractFaceBytes(
-      CameraImage image, Rect boundingBox) async {
-    try {
-      print("Starting to process bounding box: $boundingBox");
-      final img.Image convertedImage = _convertYUV420ToImage(image);
+  Uint8List _extractFaceBytes(CameraImage image, Rect boundingBox) {
+    // `CameraImage`에서 얼굴 영역을 추출하고, JPEG로 인코딩하여 `Uint8List`로 반환합니다.
+    // `image`는 `bgra8888` 포맷이므로, 이미지 변환 없이 처리 가능합니다.
 
-      // 변환된 이미지 크기
-      final int imgWidth = convertedImage.width;
-      final int imgHeight = convertedImage.height;
+    // 이미지의 전체 크기
+    final int imageWidth = image.width;
+    final int imageHeight = image.height;
 
-      print("Converted image size: $imgWidth x $imgHeight");
-      // 좌표 변환
-      final double scaleX = imgWidth / image.width;
-      final double scaleY = imgHeight / image.height;
+    // 바운딩 박스 좌표 계산
+    final int left = boundingBox.left.toInt().clamp(0, imageWidth - 1);
+    final int top = boundingBox.top.toInt().clamp(0, imageHeight - 1);
+    final int width = boundingBox.width.toInt().clamp(1, imageWidth - left);
+    final int height = boundingBox.height.toInt().clamp(1, imageHeight - top);
 
-      final int left =
-          (boundingBox.left * scaleX).clamp(0, imgWidth - 1).toInt();
-      final int top =
-          (boundingBox.top * scaleY).clamp(0, imgHeight - 1).toInt();
-      final int right =
-          (boundingBox.right * scaleX).clamp(0, imgWidth - 1).toInt();
-      final int bottom =
-          (boundingBox.bottom * scaleY).clamp(0, imgHeight - 1).toInt();
+    // 얼굴 영역의 바이트 배열 추출
+    final Uint8List faceBytes = _cropCameraImage(
+      image,
+      left,
+      top,
+      width,
+      height,
+    );
 
-      if (left < 0 || top < 0 || right <= left || bottom <= top) {
-        print("Invalid transformed bounding box. Skipping...");
-        return null;
-      }
+    // 얼굴 이미지를 JPEG로 인코딩
+    final img.Image faceImage = img.Image.fromBytes(
+      width,
+      height,
+      faceBytes,
+      format: img.Format.bgra,
+    );
 
-      // Bounding Box 크기 계산
-      final int width = (right - left).clamp(1, imgWidth).toInt();
-      final int height = (bottom - top).clamp(1, imgHeight).toInt();
+    return Uint8List.fromList(img.encodeJpg(faceImage));
+  }
 
-      // 디버깅: 좌표 및 크기 출력
-      print(
-          "Transformed Rect: left=$left, top=$top, width=$width, height=$height");
+  Uint8List _cropCameraImage(
+      CameraImage image, int x, int y, int width, int height) {
+    // `bgra8888` 포맷의 `CameraImage`에서 특정 영역을 추출합니다.
 
-      if (width <= 0 || height <= 0) {
-        print("Invalid bounding box dimensions: width=$width, height=$height");
-        return null;
-      }
+    final int bytesPerPixel = image.planes[0].bytesPerPixel ?? 4;
+    final int bytesPerRow = image.planes[0].bytesPerRow;
 
-      // 얼굴 영역 자르기
-      final img.Image faceImage =
-          img.copyCrop(convertedImage, left, top, width, height);
+    final Uint8List croppedBytes = Uint8List(width * height * bytesPerPixel);
 
-      // 자른 이미지를 JPEG로 인코딩
-      final Uint8List faceBytes = Uint8List.fromList(img.encodePng(faceImage));
+    for (int row = 0; row < height; row++) {
+      final int srcOffset = (row + y) * bytesPerRow + x * bytesPerPixel;
+      final int destOffset = row * width * bytesPerPixel;
 
-      // 갤러리에 저장
-      //await saveImageToGallery(faceBytes, imgName);
-      //print("Face bytes extracted successfully.");
-
-      return faceBytes;
-    } catch (e) {
-      print("Error extracting face bytes: $e");
-      return null;
+      croppedBytes.setRange(
+        destOffset,
+        destOffset + width * bytesPerPixel,
+        image.planes[0].bytes,
+        srcOffset,
+      );
     }
+
+    return croppedBytes;
   }
 
-  // YUV420을 RGB로 변환하는 메서드
-  img.Image _convertYUV420ToImage(CameraImage image) {
-    try {
-      final int width = image.width;
-      final int height = image.height;
-
-      print("Converting YUV420 image with size: ${width}x$height");
-      print("Image planes length: ${image.planes.length}");
-
-      if (image.planes.length == 2) {
-        print("Detected NV21/NV12 format.");
-        final img.Image imgImage = img.Image(width, height);
-
-        final Uint8List yPlane = image.planes[0].bytes;
-        final Uint8List uvPlane = image.planes[1].bytes;
-
-        for (int y = 0; y < height; y++) {
-          for (int x = 0; x < width; x++) {
-            final int yIndex = y * image.planes[0].bytesPerRow + x;
-            final int uvIndex =
-                (y ~/ 2) * image.planes[1].bytesPerRow + (x ~/ 2) * 2;
-
-            final int yValue = yPlane[yIndex];
-            final int uValue = uvPlane[uvIndex + 0];
-            final int vValue = uvPlane[uvIndex + 1];
-
-            final int r =
-                (yValue + 1.402 * (vValue - 128)).clamp(0, 255).toInt();
-            final int g =
-                (yValue - 0.344136 * (uValue - 128) - 0.714136 * (vValue - 128))
-                    .clamp(0, 255)
-                    .toInt();
-            final int b =
-                (yValue + 1.772 * (uValue - 128)).clamp(0, 255).toInt();
-
-            imgImage.setPixelRgba(x, y, r, g, b);
-          }
-        }
-
-        print("NV21/NV12 to RGB conversion complete.");
-        return imgImage;
-      }
-
-      throw Exception("Unsupported planes length: ${image.planes.length}");
-    } catch (e, stackTrace) {
-      print("Error in YUV420 to RGB conversion: $e");
-      print("Stack trace: $stackTrace");
-      rethrow;
+  // 센서 방향을 ML Kit의 InputImageRotation으로 변환
+  InputImageRotation _convertSensorOrientationToInputImageRotation(
+      int sensorOrientation) {
+    switch (sensorOrientation) {
+      case 0:
+        return InputImageRotation.rotation0deg;
+      case 90:
+        return InputImageRotation.rotation90deg;
+      case 180:
+        return InputImageRotation.rotation180deg;
+      case 270:
+        return InputImageRotation.rotation270deg;
+      default:
+        return InputImageRotation.rotation0deg;
     }
   }
 
   // 서버와 통신하여 감정 예측
   Future<String> _getEmotionFromServer(Uint8List faceBytes) async {
     try {
+      print("Starting server request...");
+      final requestStartTime = DateTime.now();
       //final String emotion = await platform.invokeMethod('getEmotion', {
       //  'faceBytes': faceBytes,
       //});
       String _emotion = "알수없음";
       String _result = "";
 
-      // 임시 디렉토리 경로 가져오기
-      final directory = await getApplicationDocumentsDirectory();
-      final imagePath = '${directory.path}/$imgName.png';
-
       final uri =
           Uri.parse("http://34.64.124.155:8000/analyze"); // 서버 주소와 포트 입력
       final request = http.MultipartRequest("POST", uri);
 
-      // 파일 추가
-      request.files.add(await http.MultipartFile.fromPath(
+      // 바이트 배열을 바로 전송
+      request.files.add(http.MultipartFile.fromBytes(
         'file', // FastAPI에서 지정한 필드 이름
-        imagePath,
+        faceBytes,
+        filename: '$imgName.png', // 파일 이름 지정
+        contentType: MediaType('image', 'png'), // 이미지 타입 지정
       ));
-
       // 요청 보내기
       final response = await request.send();
 
@@ -358,33 +305,22 @@ class _FaceDetectionPageState extends State<FaceDetectionPage>
           _result = "Error : GetEmotionFromServer Fail";
         }
       } else {
-        setState(() {
-          _result = "Error: ${response.statusCode}";
-        });
+        if (mounted) {
+          setState(() {
+            _result = "Error: ${response.statusCode}";
+          });
+        }
       }
-      print('result: $_result');
+      //print('result: $_result');
+
+      final requestEndTime = DateTime.now();
+      final requestDuration = requestEndTime.difference(requestStartTime);
+      print("Server request took ${requestDuration.inMilliseconds} ms");
 
       return _emotion;
     } catch (e) {
       print("Error uploading image: $e");
       return "알수없음";
-    }
-  }
-
-  // 센서 방향을 ML Kit의 InputImageRotation으로 변환
-  InputImageRotation _convertSensorOrientationToInputImageRotation(
-      int sensorOrientation) {
-    switch (sensorOrientation) {
-      case 0:
-        return InputImageRotation.rotation0deg;
-      case 90:
-        return InputImageRotation.rotation90deg;
-      case 180:
-        return InputImageRotation.rotation180deg;
-      case 270:
-        return InputImageRotation.rotation270deg;
-      default:
-        return InputImageRotation.rotation0deg;
     }
   }
 
@@ -396,24 +332,25 @@ class _FaceDetectionPageState extends State<FaceDetectionPage>
         body: const Center(child: CircularProgressIndicator()),
       );
     }
+
+    // 화면의 크기 가져오기
+    final Size screenSize = MediaQuery.of(context).size;
+
     return Scaffold(
       appBar: AppBar(title: const Text('Face Emotion Recognition')),
       body: Stack(
         fit: StackFit.expand,
         children: [
-          AspectRatio(
-            aspectRatio: _controller.value.aspectRatio,
-            child: CameraPreview(_controller),
-          ),
+          CameraPreview(_controller),
           // 바운딩 박스 그리기
           CustomPaint(
             painter: FacePainter(
               faces: _faces,
-              imageSize: _controller.value.previewSize!,
-              imageRotation: _convertSensorOrientationToInputImageRotation(
-                  widget.camera.sensorOrientation),
-              isFrontCamera:
-                  widget.camera.lensDirection == CameraLensDirection.front,
+              imageSize: Size(
+                _controller.value.previewSize!.height,
+                _controller.value.previewSize!.width,
+              ),
+              cameraLensDirection: widget.camera.lensDirection,
             ),
           ),
           // 감정 결과 표시
@@ -423,11 +360,11 @@ class _FaceDetectionPageState extends State<FaceDetectionPage>
             right: 0,
             child: Center(
               child: Container(
-                padding: const EdgeInsets.all(10),
+                padding: EdgeInsets.all(10),
                 color: Colors.black54,
                 child: Text(
                   'Emotion: $_emotion',
-                  style: const TextStyle(color: Colors.white, fontSize: 20),
+                  style: TextStyle(color: Colors.white, fontSize: 20),
                 ),
               ),
             ),
@@ -441,93 +378,65 @@ class _FaceDetectionPageState extends State<FaceDetectionPage>
 class FacePainter extends CustomPainter {
   final List<Face> faces;
   final Size imageSize;
-  final InputImageRotation imageRotation;
-  final bool isFrontCamera;
+  final CameraLensDirection cameraLensDirection;
 
   FacePainter({
     required this.faces,
     required this.imageSize,
-    required this.imageRotation,
-    required this.isFrontCamera,
+    required this.cameraLensDirection,
   });
 
   @override
   void paint(Canvas canvas, Size size) {
-    final paint = Paint()
+    final Paint paint = Paint()
       ..color = Colors.redAccent
       ..strokeWidth = 2.0
       ..style = PaintingStyle.stroke;
 
-    // 이미지의 회전에 따라 스케일링을 조정
-    double scaleX, scaleY;
+    // 이미지와 화면의 종횡비 계산
+    double imageAspectRatio = imageSize.height / imageSize.width;
+    double canvasAspectRatio = size.height / size.width;
 
-    switch (imageRotation) {
-      case InputImageRotation.rotation90deg:
-      case InputImageRotation.rotation270deg:
-        // 이미지가 가로로 회전된 경우
-        scaleX = size.width / imageSize.height;
-        scaleY = size.height / imageSize.width;
-        break;
-      default:
-        // 이미지가 세로로 회전된 경우
-        scaleX = size.width / imageSize.width;
-        scaleY = size.height / imageSize.height;
+    double scaleX, scaleY;
+    double dx = 0, dy = 0;
+
+    if (canvasAspectRatio > imageAspectRatio) {
+      // 화면이 더 길쭉한 경우
+      scaleX = size.width / imageSize.width;
+      scaleY = scaleX;
+      double scaledImageHeight = imageSize.height * scaleY;
+      dy = (size.height - scaledImageHeight) / 2;
+    } else {
+      // 이미지가 더 길쭉한 경우
+      scaleY = size.height / imageSize.height;
+      scaleX = scaleY;
+      double scaledImageWidth = imageSize.width * scaleX;
+      dx = (size.width - scaledImageWidth) / 2;
     }
 
-    for (var face in faces) {
-      final rect = face.boundingBox;
+    for (Face face in faces) {
+      Rect rect = face.boundingBox;
 
-      // 이미지 회전에 따라 좌표를 조정
-      Rect transformedRect;
-      switch (imageRotation) {
-        case InputImageRotation.rotation90deg:
-          transformedRect = Rect.fromLTRB(
-            rect.top * scaleX,
-            rect.left * scaleY,
-            rect.bottom * scaleX,
-            rect.right * scaleY,
-          );
-          break;
-        case InputImageRotation.rotation270deg:
-          transformedRect = Rect.fromLTRB(
-            size.width - rect.bottom * scaleX,
-            rect.left * scaleY,
-            size.width - rect.top * scaleX,
-            rect.right * scaleY,
-          );
-          break;
-        case InputImageRotation.rotation180deg:
-          transformedRect = Rect.fromLTRB(
-            size.width - rect.right * scaleX,
-            size.height - rect.bottom * scaleY,
-            size.width - rect.left * scaleX,
-            size.height - rect.top * scaleY,
-          );
-          break;
-        default:
-          transformedRect = Rect.fromLTRB(
-            rect.left * scaleX,
-            rect.top * scaleY,
-            rect.right * scaleX,
-            rect.bottom * scaleY,
-          );
-      }
+      // 좌표 변환
+      rect = Rect.fromLTRB(
+        rect.left * scaleX + dx,
+        rect.top * scaleY + dy,
+        rect.right * scaleX + dx,
+        rect.bottom * scaleY + dy,
+      );
 
       // 프론트 카메라일 경우 좌우 반전
-      if (isFrontCamera) {
-        transformedRect = Rect.fromLTRB(
-          size.width - transformedRect.right,
-          transformedRect.top,
-          size.width - transformedRect.left,
-          transformedRect.bottom,
+      if (cameraLensDirection == CameraLensDirection.front) {
+        rect = Rect.fromLTRB(
+          size.width - rect.right,
+          rect.top,
+          size.width - rect.left,
+          rect.bottom,
         );
       }
 
-      // 디버깅: 변환된 바운딩 박스 좌표 출력
-      print("Transformed Rect: $transformedRect");
-
       // 바운딩 박스 그리기
-      canvas.drawRect(transformedRect, paint);
+      canvas.drawRect(rect, paint);
     }
   }
 
@@ -535,27 +444,6 @@ class FacePainter extends CustomPainter {
   bool shouldRepaint(FacePainter oldDelegate) {
     return oldDelegate.faces != faces ||
         oldDelegate.imageSize != imageSize ||
-        oldDelegate.imageRotation != imageRotation ||
-        oldDelegate.isFrontCamera != isFrontCamera;
-  }
-}
-
-Future<void> saveImageToGallery(Uint8List imageBytes, String fileName) async {
-  try {
-    // 임시 디렉토리 경로 가져오기
-    final directory = await getApplicationDocumentsDirectory();
-    final imagePath = '${directory.path}/$fileName.png';
-
-    // 파일로 저장
-    final file = File(imagePath);
-    await file.writeAsBytes(imageBytes);
-
-    print("Image saved to Application Documents path: $imagePath");
-
-    // 갤러리에 저장
-    await GallerySaver.saveImage(imagePath);
-    print("Image saved to gallery.");
-  } catch (e) {
-    print("Error saving image to gallery: $e");
+        oldDelegate.cameraLensDirection != cameraLensDirection;
   }
 }
