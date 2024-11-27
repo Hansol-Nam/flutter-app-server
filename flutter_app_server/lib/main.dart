@@ -8,6 +8,8 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:gallery_saver/gallery_saver.dart';
 import 'dart:io';
+import 'package:http/http.dart' as http;
+import 'dart:convert'; // jsonDecode를 위해 추가
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -62,6 +64,10 @@ class _FaceDetectionPageState extends State<FaceDetectionPage>
   String _emotion = "알 수 없음";
   String imgName = "test_image";
 
+  DateTime? _lastProcessedTime; // 마지막으로 처리된 프레임 시간
+
+  static const Duration frameInterval = Duration(milliseconds: 200); // 5FPS 간격
+
   @override
   void initState() {
     super.initState();
@@ -98,6 +104,15 @@ class _FaceDetectionPageState extends State<FaceDetectionPage>
 
   // 카메라 프레임 처리
   void _processCameraImage(CameraImage image) async {
+    final now = DateTime.now();
+
+    // 5FPS 간격으로 제한
+    if (_lastProcessedTime != null &&
+        now.difference(_lastProcessedTime!) < frameInterval) {
+      return;
+    }
+    _lastProcessedTime = now;
+
     if (_isDetecting) return;
     _isDetecting = true;
 
@@ -137,8 +152,12 @@ class _FaceDetectionPageState extends State<FaceDetectionPage>
       final faces = await _faceDetector.processImage(inputImage);
 
       if (faces.isEmpty) {
-        print("No faces detected in the frame.");
+        // 얼굴이 감지되지 않음
         _isDetecting = false;
+        setState(() {
+          _faces = [];
+          _emotion = "알 수 없음";
+        });
         return;
       }
 
@@ -235,8 +254,8 @@ class _FaceDetectionPageState extends State<FaceDetectionPage>
       final Uint8List faceBytes = Uint8List.fromList(img.encodePng(faceImage));
 
       // 갤러리에 저장
-      await saveImageToGallery(faceBytes, imgName);
-      print("Face bytes extracted successfully.");
+      //await saveImageToGallery(faceBytes, imgName);
+      //print("Face bytes extracted successfully.");
 
       return faceBytes;
     } catch (e) {
@@ -302,12 +321,53 @@ class _FaceDetectionPageState extends State<FaceDetectionPage>
       //final String emotion = await platform.invokeMethod('getEmotion', {
       //  'faceBytes': faceBytes,
       //});
-      final String emotion = "test";
-      print('Emotion detected: $emotion');
-      return emotion;
-    } on PlatformException catch (e) {
-      print("Failed to get emotion: '${e.message}'.");
-      return "오류 발생";
+      String _emotion = "알수없음";
+      String _result = "";
+
+      // 임시 디렉토리 경로 가져오기
+      final directory = await getApplicationDocumentsDirectory();
+      final imagePath = '${directory.path}/$imgName.png';
+
+      final uri =
+          Uri.parse("http://34.64.124.155:8000/analyze"); // 서버 주소와 포트 입력
+      final request = http.MultipartRequest("POST", uri);
+
+      // 파일 추가
+      request.files.add(await http.MultipartFile.fromPath(
+        'file', // FastAPI에서 지정한 필드 이름
+        imagePath,
+      ));
+
+      // 요청 보내기
+      final response = await request.send();
+
+      // 응답 처리
+      if (response.statusCode == 200) {
+        final responseData = await response.stream.bytesToString();
+        final data = jsonDecode(responseData);
+
+        // JSON 응답에서 emotion과 logits 추출
+        if (data['status'] == 'success' && data['result'] is Map) {
+          final result = data['result'] as Map<String, dynamic>;
+          final emotion = result['emotion'] as String;
+          final logits = result['logits'] as List<dynamic>;
+
+          _result = "Emotion: $emotion\nLogits: $logits";
+          _emotion = emotion;
+        } else {
+          _result = "Error : GetEmotionFromServer Fail";
+        }
+      } else {
+        setState(() {
+          _result = "Error: ${response.statusCode}";
+        });
+      }
+      print('result: $_result');
+
+      return _emotion;
+    } catch (e) {
+      print("Error uploading image: $e");
+      return "알수없음";
     }
   }
 
@@ -483,14 +543,14 @@ class FacePainter extends CustomPainter {
 Future<void> saveImageToGallery(Uint8List imageBytes, String fileName) async {
   try {
     // 임시 디렉토리 경로 가져오기
-    final directory = await getTemporaryDirectory();
+    final directory = await getApplicationDocumentsDirectory();
     final imagePath = '${directory.path}/$fileName.png';
 
     // 파일로 저장
     final file = File(imagePath);
     await file.writeAsBytes(imageBytes);
 
-    print("Image saved to temporary path: $imagePath");
+    print("Image saved to Application Documents path: $imagePath");
 
     // 갤러리에 저장
     await GallerySaver.saveImage(imagePath);
