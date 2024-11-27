@@ -8,15 +8,14 @@ import 'package:image/image.dart' as img;
 import 'package:permission_handler/permission_handler.dart';
 import 'dart:math' as math;
 import 'package:http/http.dart' as http;
-import 'dart:convert'; // jsonDecode를 위해 추가
-import 'dart:isolate';
-import 'package:path_provider/path_provider.dart'; // 추가
-import 'package:http_parser/http_parser.dart'; // MediaType을 위해 필요
+import 'dart:convert';
+import 'package:path_provider/path_provider.dart';
+import 'package:http_parser/http_parser.dart';
+import 'package:flutter/foundation.dart'; // compute 함수를 사용하기 위해 추가
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  // 사용 가능한 카메라 목록 가져오기
   final cameras = await availableCameras();
   final firstCamera = cameras.first;
 
@@ -61,7 +60,6 @@ class _FaceDetectionPageState extends State<FaceDetectionPage>
       performanceMode: FaceDetectorMode.fast,
     ),
   );
-  //bool _isDetecting = false;
   List<Face> _faces = [];
   String _emotion = "알 수 없음";
 
@@ -70,9 +68,12 @@ class _FaceDetectionPageState extends State<FaceDetectionPage>
 
   static const Duration frameInterval =
       Duration(milliseconds: 50); // 프레임 처리 간격 조정
-  static const Duration emotionInterval = Duration(seconds: 2); // 감정 예측 간격 조정
+  static const Duration emotionInterval =
+      Duration(seconds: 3); // 감정 예측 간격 조정 (조절 가능)
 
   String imgName = "test_image";
+
+  bool _isProcessing = false; // 새로운 상태 변수
 
   @override
   void initState() {
@@ -118,14 +119,10 @@ class _FaceDetectionPageState extends State<FaceDetectionPage>
     }
     _lastProcessedTime = now;
 
-    //if (_isDetecting) return;
-    //_isDetecting = true;
+    if (_isProcessing) return; // 이미 처리 중이면 새 요청 방지
 
     try {
-      // `CameraImage`를 `InputImage`로 변환
       final inputImage = _getInputImageFromCameraImage(image);
-
-      // 메인 스레드에서 얼굴 감지 수행
       final faces = await _faceDetector.processImage(inputImage);
 
       if (mounted) {
@@ -137,15 +134,13 @@ class _FaceDetectionPageState extends State<FaceDetectionPage>
       if (faces.isNotEmpty) {
         final faceRect = faces.first.boundingBox;
 
-        // 얼굴 영역 추출
-        final Uint8List faceBytes = _extractFaceBytes(image, faceRect);
+        final Uint8List faceBytes = await _extractFaceBytes(image, faceRect);
 
         final now = DateTime.now();
         if (_lastEmotionTime == null ||
             now.difference(_lastEmotionTime!) >= emotionInterval) {
           _lastEmotionTime = now;
 
-          // 감정 예측 수행
           String emotion = await _getEmotionFromServer(faceBytes);
           if (mounted) {
             setState(() {
@@ -155,9 +150,7 @@ class _FaceDetectionPageState extends State<FaceDetectionPage>
         }
       }
     } catch (e) {
-      print("Error processing image: $e");
-    } finally {
-      //  _isDetecting = false;
+      print("이미지 처리 오류: $e");
     }
   }
 
@@ -188,21 +181,40 @@ class _FaceDetectionPageState extends State<FaceDetectionPage>
     return inputImage;
   }
 
-  Uint8List _extractFaceBytes(CameraImage image, Rect boundingBox) {
-    // `CameraImage`에서 얼굴 영역을 추출하고, JPEG로 인코딩하여 `Uint8List`로 반환합니다.
-    // `image`는 `bgra8888` 포맷이므로, 이미지 변환 없이 처리 가능합니다.
+  // 이미지 변환을 별도의 Isolate에서 처리
+  static Uint8List _convertImage(List<dynamic> params) {
+    Uint8List faceBytes = params[0];
+    int width = params[1];
+    int height = params[2];
 
-    // 이미지의 전체 크기
+    final img.Image faceImage = img.Image.fromBytes(
+      width,
+      height,
+      faceBytes,
+      format: img.Format.bgra,
+    );
+
+    // 이미지 크기 축소 (예: 50% 축소)
+    final img.Image resizedImage = img.copyResize(
+      faceImage,
+      width: (faceImage.width * 0.5).toInt(),
+      height: (faceImage.height * 0.5).toInt(),
+    );
+
+    return Uint8List.fromList(
+        img.encodeJpg(resizedImage, quality: 80)); // 품질 조정
+  }
+
+  Future<Uint8List> _extractFaceBytes(
+      CameraImage image, Rect boundingBox) async {
     final int imageWidth = image.width;
     final int imageHeight = image.height;
 
-    // 바운딩 박스 좌표 계산
     final int left = boundingBox.left.toInt().clamp(0, imageWidth - 1);
     final int top = boundingBox.top.toInt().clamp(0, imageHeight - 1);
     final int width = boundingBox.width.toInt().clamp(1, imageWidth - left);
     final int height = boundingBox.height.toInt().clamp(1, imageHeight - top);
 
-    // 얼굴 영역의 바이트 배열 추출
     final Uint8List faceBytes = _cropCameraImage(
       image,
       left,
@@ -211,21 +223,15 @@ class _FaceDetectionPageState extends State<FaceDetectionPage>
       height,
     );
 
-    // 얼굴 이미지를 JPEG로 인코딩
-    final img.Image faceImage = img.Image.fromBytes(
-      width,
-      height,
-      faceBytes,
-      format: img.Format.bgra,
-    );
+    // compute 함수를 사용하여 별도의 Isolate에서 이미지 변환 수행
+    final Uint8List resizedFaceBytes =
+        await compute(_convertImage, [faceBytes, width, height]);
 
-    return Uint8List.fromList(img.encodeJpg(faceImage));
+    return resizedFaceBytes;
   }
 
   Uint8List _cropCameraImage(
       CameraImage image, int x, int y, int width, int height) {
-    // `bgra8888` 포맷의 `CameraImage`에서 특정 영역을 추출합니다.
-
     final int bytesPerPixel = image.planes[0].bytesPerPixel ?? 4;
     final int bytesPerRow = image.planes[0].bytesPerRow;
 
@@ -246,7 +252,6 @@ class _FaceDetectionPageState extends State<FaceDetectionPage>
     return croppedBytes;
   }
 
-  // 센서 방향을 ML Kit의 InputImageRotation으로 변환
   InputImageRotation _convertSensorOrientationToInputImageRotation(
       int sensorOrientation) {
     switch (sensorOrientation) {
@@ -265,62 +270,57 @@ class _FaceDetectionPageState extends State<FaceDetectionPage>
 
   // 서버와 통신하여 감정 예측
   Future<String> _getEmotionFromServer(Uint8List faceBytes) async {
-    try {
-      print("Starting server request...");
-      final requestStartTime = DateTime.now();
-      //final String emotion = await platform.invokeMethod('getEmotion', {
-      //  'faceBytes': faceBytes,
-      //});
-      String _emotion = "알수없음";
-      String _result = "";
+    setState(() {
+      _isProcessing = true; // 처리 시작
+      _emotion = "처리 중..."; // 처리 중임을 표시
+      //print("처리 시작: _isProcessing = $_isProcessing");
+    });
 
-      final uri =
-          Uri.parse("http://34.64.124.155:8000/analyze"); // 서버 주소와 포트 입력
+    try {
+      //print("서버 요청 시작...");
+      final requestStartTime = DateTime.now();
+
+      String emotion = "알 수 없음";
+
+      final uri = Uri.parse("http://34.64.124.155:8000/analyze"); // 서버 주소와 포트
       final request = http.MultipartRequest("POST", uri);
 
-      // 바이트 배열을 바로 전송
       request.files.add(http.MultipartFile.fromBytes(
-        'file', // FastAPI에서 지정한 필드 이름
+        'file', // 서버에서 기대하는 필드 이름
         faceBytes,
-        filename: '$imgName.png', // 파일 이름 지정
+        filename: '$imgName.png', // 파일 이름
         contentType: MediaType('image', 'png'), // 이미지 타입 지정
       ));
-      // 요청 보내기
+
       final response = await request.send();
 
-      // 응답 처리
       if (response.statusCode == 200) {
         final responseData = await response.stream.bytesToString();
         final data = jsonDecode(responseData);
 
-        // JSON 응답에서 emotion과 logits 추출
         if (data['status'] == 'success' && data['result'] is Map) {
-          final result = data['result'] as Map<String, dynamic>;
-          final emotion = result['emotion'] as String;
-          final logits = result['logits'] as List<dynamic>;
-
-          _result = "Emotion: $emotion\nLogits: $logits";
-          _emotion = emotion;
+          final resultData = data['result'] as Map<String, dynamic>;
+          emotion = resultData['emotion'] as String;
         } else {
-          _result = "Error : GetEmotionFromServer Fail";
+          print("서버 응답 오류: 감정 분석 실패");
         }
       } else {
-        if (mounted) {
-          setState(() {
-            _result = "Error: ${response.statusCode}";
-          });
-        }
+        print("서버 응답 오류: 상태 코드 ${response.statusCode}");
       }
-      //print('result: $_result');
 
       final requestEndTime = DateTime.now();
       final requestDuration = requestEndTime.difference(requestStartTime);
-      print("Server request took ${requestDuration.inMilliseconds} ms");
+      print("서버 요청 시간: ${requestDuration.inMilliseconds} ms");
 
-      return _emotion;
+      return emotion;
     } catch (e) {
-      print("Error uploading image: $e");
-      return "알수없음";
+      print("이미지 업로드 오류: $e");
+      return "알 수 없음";
+    } finally {
+      setState(() {
+        _isProcessing = false; // 처리 종료
+        //print("처리 종료: _isProcessing = $_isProcessing");
+      });
     }
   }
 
@@ -333,7 +333,6 @@ class _FaceDetectionPageState extends State<FaceDetectionPage>
       );
     }
 
-    // 화면의 크기 가져오기
     final Size screenSize = MediaQuery.of(context).size;
 
     return Scaffold(
@@ -342,7 +341,6 @@ class _FaceDetectionPageState extends State<FaceDetectionPage>
         fit: StackFit.expand,
         children: [
           CameraPreview(_controller),
-          // 바운딩 박스 그리기
           CustomPaint(
             painter: FacePainter(
               faces: _faces,
@@ -369,6 +367,27 @@ class _FaceDetectionPageState extends State<FaceDetectionPage>
               ),
             ),
           ),
+          // 처리 중 오버레이
+          if (_isProcessing)
+            Container(
+              color: Colors.black45,
+              child: Center(
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    CircularProgressIndicator(
+                      valueColor: AlwaysStoppedAnimation<Color>(Colors.white),
+                      strokeWidth: 2.0,
+                    ),
+                    SizedBox(width: 10),
+                    Text(
+                      '처리 중...',
+                      style: TextStyle(color: Colors.white, fontSize: 20),
+                    ),
+                  ],
+                ),
+              ),
+            ),
         ],
       ),
     );
